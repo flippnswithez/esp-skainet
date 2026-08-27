@@ -1,3 +1,6 @@
+if(CONFIG_RESPEAKER_LITE_XIAO_BOARD)
+    list(APPEND BSP_BOARD_SRC "./boards/respeaker-lite-xiao")
+endif()
 if(CONFIG_ESP32_S3_KORVO_1_V4_0_BOARD)
     list(APPEND BSP_BOARD_SRC "./boards/esp32s3-korvo-1")
 endif()

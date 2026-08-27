@@ -37,6 +37,8 @@
     #include "esp32_s3_korvo_2_v3_board.h"
 #elif CONFIG_ESP32_S3_EYE_BOARD
     #include "esp32_s3_eye_board.h"
+#elif CONFIG_RESPEAKER_LITE_XIAO_BOARD
+    #include "respeaker_lite_xiao_board.h"
 #elif CONFIG_ESP_CUSTOM_BOARD
     #include "esp_custom_board.h"
 #elif CONFIG_ESP32_S3_BOX_LITE_BOARD
