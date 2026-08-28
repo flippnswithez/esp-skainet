@@ -26,6 +26,9 @@ esp_err_t bsp_board_init(uint32_t sample_rate, int channel_format, int bits_per_
     i2s_chan_config_t chan_cfg =
         I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_SLAVE);
 
+    /* Clear transmitted DMA data after playback so stale audio cannot loop. */
+    chan_cfg.auto_clear = true;
+
     esp_err_t ret = i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(ret));

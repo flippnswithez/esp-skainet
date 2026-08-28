@@ -22,6 +22,61 @@ int detect_flag = 0;
 static const esp_afe_sr_iface_t *afe_handle = NULL;
 static volatile int task_flag = 0;
 
+static void play_wake_chime(void)
+{
+    static const int16_t sine_lut[16] = {
+         0,  1913,  3535,  4619,
+      5000,  4619,  3535,  1913,
+         0, -1913, -3535, -4619,
+     -5000, -4619, -3535, -1913
+    };
+
+    const int sample_rate = 16000;
+    const int duration_ms = 140;
+    const int sample_count = sample_rate * duration_ms / 1000;
+
+    int16_t *tone = malloc(sample_count * sizeof(int16_t));
+    if (!tone) {
+        printf("wake chime allocation failed\n");
+        return;
+    }
+
+    uint32_t phase = 0;
+
+    for (int i = 0; i < sample_count; i++) {
+        int frequency = (i < sample_count / 2) ? 880 : 1175;
+
+        uint32_t phase_inc =
+            (uint32_t)(((uint64_t)frequency << 32) / sample_rate);
+
+        phase += phase_inc;
+
+        int32_t sample = sine_lut[phase >> 28];
+
+        /* Short fade-in/out to avoid clicks. */
+        int edge = sample_count / 12;
+
+        if (i < edge) {
+            sample = sample * i / edge;
+        } else if (i >= sample_count - edge) {
+            sample = sample * (sample_count - 1 - i) / edge;
+        }
+
+        tone[i] = (int16_t)sample;
+    }
+
+    esp_err_t ret =
+        esp_audio_play(tone, sample_count * sizeof(int16_t),
+                       pdMS_TO_TICKS(500));
+
+    if (ret != ESP_OK) {
+        printf("wake chime playback failed: %s\n",
+               esp_err_to_name(ret));
+    }
+
+    free(tone);
+}
+
 void feed_Task(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
@@ -69,6 +124,7 @@ void detect_Task(void *arg)
         if (res->wakeup_state == WAKENET_DETECTED) {
             printf("wakeword detected\n");
 	        printf("model index:%d, word index:%d\n", res->wakenet_model_index, res->wake_word_index);
+            play_wake_chime();
             printf("-----------LISTENING-----------\n");
         }
     }
