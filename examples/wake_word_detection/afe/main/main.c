@@ -9,6 +9,16 @@
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
+
 #include "esp_wn_iface.h"
 #include "esp_wn_models.h"
 #include "esp_afe_sr_models.h"
@@ -31,9 +41,224 @@ static int16_t *capture_buffer = NULL;
 static volatile size_t capture_samples = 0;
 static volatile bool capture_active = false;
 static volatile int32_t capture_peak = 0;
+static volatile bool capture_send_active = false;
+
+static EventGroupHandle_t wifi_event_group;
+static int wifi_retry_count = 0;
+
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+
+static void wifi_event_handler(void *arg,
+                               esp_event_base_t event_base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    (void)arg;
+
+    if (event_base == WIFI_EVENT &&
+        event_id == WIFI_EVENT_STA_START) {
+
+        esp_wifi_connect();
+
+    } else if (event_base == WIFI_EVENT &&
+               event_id == WIFI_EVENT_STA_DISCONNECTED) {
+
+        wifi_event_sta_disconnected_t *disc =
+            (wifi_event_sta_disconnected_t *)event_data;
+
+        printf("SAT-001 Wi-Fi disconnected, reason=%d\n",
+               disc->reason);
+
+        if (wifi_retry_count < 10) {
+            wifi_retry_count++;
+            esp_wifi_connect();
+            printf("SAT-001 Wi-Fi reconnect attempt %d\n",
+                   wifi_retry_count);
+        } else {
+            xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+        }
+
+    } else if (event_base == IP_EVENT &&
+               event_id == IP_EVENT_STA_GOT_IP) {
+
+        ip_event_got_ip_t *event =
+            (ip_event_got_ip_t *)event_data;
+
+        printf("SAT-001 Wi-Fi connected: " IPSTR "\n",
+               IP2STR(&event->ip_info.ip));
+
+        wifi_retry_count = 0;
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static bool sat_wifi_init(void)
+{
+    esp_err_t ret = nvs_flash_init();
+
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+
+    ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_event_group = xEventGroupCreate();
+    assert(wifi_event_group);
+
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            WIFI_EVENT,
+            ESP_EVENT_ANY_ID,
+            &wifi_event_handler,
+            NULL
+        )
+    );
+
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            IP_EVENT,
+            IP_EVENT_STA_GOT_IP,
+            &wifi_event_handler,
+            NULL
+        )
+    );
+
+    wifi_config_t wifi_config = {0};
+
+    strlcpy((char *)wifi_config.sta.ssid,
+            CONFIG_SAT_WIFI_SSID,
+            sizeof(wifi_config.sta.ssid));
+
+    strlcpy((char *)wifi_config.sta.password,
+            CONFIG_SAT_WIFI_PASSWORD,
+            sizeof(wifi_config.sta.password));
+
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(
+        esp_wifi_set_config(WIFI_IF_STA, &wifi_config)
+    );
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    printf("SAT-001 connecting to Wi-Fi...\n");
+
+    EventBits_t bits =
+        xEventGroupWaitBits(
+            wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY
+        );
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        return true;
+    }
+
+    printf("SAT-001 Wi-Fi connection failed\n");
+    return false;
+}
+
+static void send_capture_task(void *arg)
+{
+    (void)arg;
+
+    const size_t total_bytes =
+        SAT_CAPTURE_SAMPLES * sizeof(int16_t);
+
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+
+    if (sock < 0) {
+        printf("SAT-001 socket creation failed\n");
+        capture_send_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in dest = {0};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(CONFIG_SAT_SERVER_PORT);
+
+    if (inet_pton(AF_INET,
+                  CONFIG_SAT_SERVER_IP,
+                  &dest.sin_addr) != 1) {
+
+        printf("SAT-001 invalid server IP: %s\n",
+               CONFIG_SAT_SERVER_IP);
+
+        close(sock);
+        capture_send_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    printf("SAT-001 connecting to Arvis %s:%d\n",
+           CONFIG_SAT_SERVER_IP,
+           CONFIG_SAT_SERVER_PORT);
+
+    if (connect(sock,
+                (struct sockaddr *)&dest,
+                sizeof(dest)) != 0) {
+
+        printf("SAT-001 TCP connection failed\n");
+
+        close(sock);
+        capture_send_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    size_t sent = 0;
+    const uint8_t *bytes =
+        (const uint8_t *)capture_buffer;
+
+    while (sent < total_bytes) {
+
+        int written =
+            send(sock,
+                 bytes + sent,
+                 total_bytes - sent,
+                 0);
+
+        if (written <= 0) {
+            printf("SAT-001 TCP send failed after %u bytes\n",
+                   (unsigned)sent);
+            break;
+        }
+
+        sent += (size_t)written;
+    }
+
+    shutdown(sock, SHUT_RDWR);
+    close(sock);
+
+    printf("SAT-001 sent %u of %u audio bytes\n",
+           (unsigned)sent,
+           (unsigned)total_bytes);
+
+    capture_send_active = false;
+    vTaskDelete(NULL);
+}
 
 static void start_mic_capture(void)
 {
+    if (capture_active || capture_send_active) {
+        printf("SAT-001 capture busy\n");
+        return;
+    }
+
     capture_samples = 0;
     capture_peak = 0;
     capture_active = true;
@@ -138,6 +363,21 @@ void feed_Task(void *arg)
                 printf("SAT-001 microphone capture complete: %u samples, peak=%ld\n",
                        (unsigned)capture_samples,
                        (long)capture_peak);
+
+                capture_send_active = true;
+
+                if (xTaskCreate(
+                        send_capture_task,
+                        "sat_send",
+                        6 * 1024,
+                        NULL,
+                        4,
+                        NULL
+                    ) != pdPASS) {
+
+                    printf("SAT-001 failed to create send task\n");
+                    capture_send_active = false;
+                }
             }
         }
 
@@ -207,6 +447,10 @@ void app_main()
 
     printf("SAT-001 capture buffer ready: %u bytes\n",
            (unsigned)(SAT_CAPTURE_SAMPLES * sizeof(int16_t)));
+
+    if (!sat_wifi_init()) {
+        printf("SAT-001 continuing without network send capability\n");
+    }
 
     srmodel_list_t *models = esp_srmodel_init("model");
     if (models) {

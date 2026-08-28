@@ -1,0 +1,20 @@
+menu "SAT-001 bench network"
+
+config SAT_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+
+config SAT_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+
+config SAT_SERVER_IP
+    string "Arvis receiver IP"
+    default "192.168.0.10"
+
+config SAT_SERVER_PORT
+    int "Arvis receiver port"
+    range 1 65535
+    default 5005
+
+endmenu
