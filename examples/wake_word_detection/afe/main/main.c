@@ -17,10 +17,30 @@
 #include "esp_board_init.h"
 #include "model_path.h"
 #include "string.h"
+#include "esp_heap_caps.h"
 
 int detect_flag = 0;
 static const esp_afe_sr_iface_t *afe_handle = NULL;
 static volatile int task_flag = 0;
+
+#define SAT_CAPTURE_SAMPLE_RATE 16000
+#define SAT_CAPTURE_MS 2000
+#define SAT_CAPTURE_SAMPLES     ((SAT_CAPTURE_SAMPLE_RATE * SAT_CAPTURE_MS) / 1000)
+
+static int16_t *capture_buffer = NULL;
+static volatile size_t capture_samples = 0;
+static volatile bool capture_active = false;
+static volatile int32_t capture_peak = 0;
+
+static void start_mic_capture(void)
+{
+    capture_samples = 0;
+    capture_peak = 0;
+    capture_active = true;
+
+    printf("SAT-001 microphone capture started: %d ms\n",
+           SAT_CAPTURE_MS);
+}
 
 static void play_wake_chime(void)
 {
@@ -90,6 +110,37 @@ void feed_Task(void *arg)
     while (task_flag) {
         esp_get_feed_data(true, i2s_buff, audio_chunksize * sizeof(int16_t) * feed_channel);
 
+        if (capture_active && capture_buffer) {
+            for (int i = 0;
+                 i < audio_chunksize && capture_samples < SAT_CAPTURE_SAMPLES;
+                 i++) {
+
+                /*
+                 * SAT-001 receives two interleaved microphone channels.
+                 * Store channel 0 as 16 kHz mono PCM for this bench capture.
+                 */
+                int16_t sample = i2s_buff[i * feed_channel];
+                capture_buffer[capture_samples++] = sample;
+
+                int32_t level = sample;
+                if (level < 0) {
+                    level = -level;
+                }
+
+                if (level > capture_peak) {
+                    capture_peak = level;
+                }
+            }
+
+            if (capture_samples >= SAT_CAPTURE_SAMPLES) {
+                capture_active = false;
+
+                printf("SAT-001 microphone capture complete: %u samples, peak=%ld\n",
+                       (unsigned)capture_samples,
+                       (long)capture_peak);
+            }
+        }
+
         afe_handle->feed(afe_data, i2s_buff);
     }
     if (i2s_buff) {
@@ -125,6 +176,7 @@ void detect_Task(void *arg)
             printf("wakeword detected\n");
 	        printf("model index:%d, word index:%d\n", res->wakenet_model_index, res->wake_word_index);
             play_wake_chime();
+            start_mic_capture();
             printf("-----------LISTENING-----------\n");
         }
     }
@@ -139,6 +191,22 @@ void app_main()
 {
     ESP_ERROR_CHECK(esp_board_init(16000, 1, 16));
     // ESP_ERROR_CHECK(esp_sdcard_init("/sdcard", 10));
+
+    capture_buffer = heap_caps_malloc(
+        SAT_CAPTURE_SAMPLES * sizeof(int16_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+    );
+
+    if (!capture_buffer) {
+        capture_buffer = malloc(
+            SAT_CAPTURE_SAMPLES * sizeof(int16_t)
+        );
+    }
+
+    assert(capture_buffer);
+
+    printf("SAT-001 capture buffer ready: %u bytes\n",
+           (unsigned)(SAT_CAPTURE_SAMPLES * sizeof(int16_t)));
 
     srmodel_list_t *models = esp_srmodel_init("model");
     if (models) {
