@@ -6,6 +6,7 @@ set(requires
     esp_netif
     nvs_flash
     lwip
+    esp_timer
     )
 
 idf_component_register(SRCS main.c
