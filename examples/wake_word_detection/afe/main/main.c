@@ -241,12 +241,89 @@ static void send_capture_task(void *arg)
         sent += (size_t)written;
     }
 
-    shutdown(sock, SHUT_RDWR);
-    close(sock);
-
     printf("SAT-001 sent %u of %u audio bytes\n",
            (unsigned)sent,
            (unsigned)total_bytes);
+
+    if (sent == total_bytes) {
+        printf("SAT-001 waiting for Arvis response audio...\n");
+
+        uint8_t *net_buffer = malloc(1024);
+        int16_t *pcm_buffer = malloc(512 * sizeof(int16_t));
+
+        if (!net_buffer || !pcm_buffer) {
+            printf("SAT-001 response buffer allocation failed\n");
+        } else {
+            size_t response_bytes = 0;
+            bool have_low_byte = false;
+            uint8_t low_byte = 0;
+
+            while (1) {
+                int received =
+                    recv(sock, net_buffer, 1024, 0);
+
+                if (received == 0) {
+                    break;
+                }
+
+                if (received < 0) {
+                    printf("SAT-001 response receive failed\n");
+                    break;
+                }
+
+                response_bytes += (size_t)received;
+
+                size_t samples = 0;
+
+                for (int i = 0; i < received; i++) {
+                    uint8_t byte = net_buffer[i];
+
+                    if (!have_low_byte) {
+                        low_byte = byte;
+                        have_low_byte = true;
+                    } else {
+                        pcm_buffer[samples++] =
+                            (int16_t)(
+                                (uint16_t)low_byte |
+                                ((uint16_t)byte << 8)
+                            );
+
+                        have_low_byte = false;
+                    }
+                }
+
+                if (samples > 0) {
+                    esp_err_t play_ret =
+                        esp_audio_play(
+                            pcm_buffer,
+                            samples * sizeof(int16_t),
+                            pdMS_TO_TICKS(1000)
+                        );
+
+                    if (play_ret != ESP_OK) {
+                        printf(
+                            "SAT-001 response playback failed: %s\n",
+                            esp_err_to_name(play_ret)
+                        );
+                        break;
+                    }
+                }
+            }
+
+            printf("SAT-001 received %u response audio bytes\n",
+                   (unsigned)response_bytes);
+
+            if (response_bytes > 0) {
+                printf("SAT-001 response playback complete\n");
+            }
+        }
+
+        free(net_buffer);
+        free(pcm_buffer);
+    }
+
+    shutdown(sock, SHUT_RDWR);
+    close(sock);
 
     capture_send_active = false;
     vTaskDelete(NULL);
