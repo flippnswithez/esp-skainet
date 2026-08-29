@@ -87,11 +87,22 @@
 #define SAT_SILENCE_HANGOVER_MS     600   /* trailing silence ends utterance  */
 #define SAT_MIN_SPEECH_MS           200   /* below this is not an utterance   */
 
-/* Fallback speech detector. res->data_volume is AFE's own mean-square frame
- * energy in dBFS (pre-AGC). If VAD never triggers -- misconfiguration, a
- * missing model, an unexpectedly quiet room -- this keeps the endpoint
- * functional instead of aborting every utterance as no_speech. */
+/* Fallback speech detector -- SAFETY NET ONLY, never a vote on timing.
+ *
+ * res->data_volume is AFE's own mean-square frame energy in dBFS (pre-AGC).
+ * An earlier version OR'd this with VAD when classifying each frame; because
+ * a normal room noise floor sits above -45 dBFS it reported speech on nearly
+ * every frame, so trailing silence never accumulated and every utterance ran
+ * to the full SAT_MAX_UTTERANCE_MS cap (measured: vad_speech_ms=2144 but
+ * energy_speech_ms=7840). VAD now owns timing outright.
+ *
+ * This detector survives only to rescue a NON-FUNCTIONAL VAD: it can override
+ * an abort, and only when the audio was unmistakably loud. Measured speech
+ * peaks were -9.6..-10.7 dBFS, far above any noise floor, so the peak gate
+ * cleanly separates real speech from a noisy empty room. */
 #define SAT_ENERGY_SPEECH_DBFS   (-45.0f)
+#define SAT_ENERGY_RESCUE_PEAK_DBFS (-25.0f)
+#define SAT_ENERGY_RESCUE_MIN_MS      500
 
 /* AFE VAD shaping (see esp_afe_config.h) */
 #define SAT_VAD_MIN_SPEECH_MS       128
@@ -1021,7 +1032,11 @@ void detect_Task(void *arg)
             energy_speech_ms += frame_ms;
         }
 
-        if (vad_says_speech || energy_says_speech) {
+        /*
+         * VAD ONLY. Do not reintroduce energy here -- see the comment on
+         * SAT_ENERGY_SPEECH_DBFS for the measurement that ruled it out.
+         */
+        if (vad_says_speech) {
             had_speech = true;
             speech_ms += frame_ms;
             silence_ms = 0;
@@ -1056,6 +1071,22 @@ void detect_Task(void *arg)
         } else if (!had_speech && listen_ms >= SAT_NO_SPEECH_TIMEOUT_MS) {
             abort_utterance = true;
             reason = "no_speech";
+        }
+
+        /*
+         * Safety net: VAD produced nothing at all, yet the microphone clearly
+         * heard something loud. Prefer sending it over silently discarding a
+         * real utterance because VAD is misconfigured or its model is missing.
+         */
+        if (abort_utterance && vad_speech_ms == 0 &&
+            energy_speech_ms >= SAT_ENERGY_RESCUE_MIN_MS &&
+            peak_dbfs > SAT_ENERGY_RESCUE_PEAK_DBFS) {
+            printf("SAT-001 VAD produced nothing; energy rescue engaged "
+                   "(energy_speech_ms=%d peak_dbfs=%.1f)\n",
+                   energy_speech_ms, (double)peak_dbfs);
+            abort_utterance = false;
+            complete = true;
+            reason = "energy_rescue";
         }
 
         if (!complete && !abort_utterance) {
